@@ -5,6 +5,11 @@ import os
 import random
 import re
 import sys
+# Forzar UTF-8 en Windows para que los emojis no crasheen la terminal
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -61,9 +66,10 @@ EXCLUSION_PATTERN = re.compile(
     r'\bno ac\b|\bno charger\b|\bno power adapter\b|\bno ac adapter\b|'
     r'\bwithout charger\b|\bw/o charger\b|\bmissing charger\b|\bmissing power\b|'
     r'\bno power cord\b|\bwithout power cord\b|\bmissing cord\b|'
+    r'\bno\b.{0,15}\bpower adapter\b|'
     r'\bdevice only\b|\blaptop only\b|'
-    r'\bbarebone\b|\bgrade c\b|\bgrade d\b|\bfair condition\b|\bacceptable\b|\bheavy wear\b|\bheavily scratched\b|'
-    r'\bas is\b|\bas-is\b|\buntested\b|\bno power\b|\bwont turn on\b|\bdeep scratches\b|\bchipped\b|'
+    r'\bbarebone\b|\bgrade c\b|\bgrade d\b|\bfair condition\b|\bheavy wear\b|\bheavily scratched\b|\bdeep scratches\b|\bchipped\b|'
+    r'\bas is\b|\bas-is\b|\buntested\b|\bno power\b|\bwont turn on\b|'
     r'\bicloud\b|\bmdm\b|\bbios lock\b|\bcomputrace\b|[\*\#]+read[\*\#]+|\bread description\b|'
     r'\bplease read\b|\bmust read\b|\bsee notes\b|\bread notes\b|\bcheck notes\b|\bneeds repair\b|'
     r'\bburn[- ]in\b|\bcracked\b|\bcrack\b|'
@@ -133,6 +139,7 @@ class OfertaLaptop:
     imagen: str
     es_subasta: bool
     tiempo_restante: str
+    vendedor: str = ""
 
 # --- FUNCIONES DE UTILIDAD Y TIEMPO ---
 def calcular_tiempo_restante(fecha_fin_iso: str) -> str:
@@ -172,11 +179,51 @@ def lista_env(nombre: str, default: List[str]) -> List[str]:
     if not valor.strip(): return list(default)
     return [item.strip() for item in valor.split(",") if item.strip()]
 
+def _parsear_destinos_extra() -> List[Tuple[str, str]]:
+    """Lee TELEGRAM_EXTRA_1, TELEGRAM_EXTRA_2, etc. del .env.
+    Formato: token:chat_id (separados por dos puntos)."""
+    destinos = []
+    i = 1
+    while True:
+        raw = os.getenv(f"TELEGRAM_EXTRA_{i}", "").strip()
+        if not raw:
+            break
+        if ":" in raw:
+            token, chat_id = raw.split(":", 1)
+            # El token de Telegram tiene formato NNNNNNN:AAAA..., así que hay que re-juntar
+            # Formato esperado en .env: TELEGRAM_EXTRA_1=TOKEN_COMPLETO|CHAT_ID
+            pass
+        i += 1
+    # Usar formato con pipe: TOKEN|CHAT_ID
+    i = 1
+    destinos = []
+    while True:
+        raw = os.getenv(f"TELEGRAM_EXTRA_{i}", "").strip()
+        if not raw:
+            break
+        if "|" in raw:
+            token, chat_id = raw.rsplit("|", 1)
+            if token.strip() and chat_id.strip():
+                destinos.append((token.strip(), chat_id.strip()))
+        i += 1
+    return destinos
+
+def _todos_los_destinos(config: dict) -> List[Tuple[str, str]]:
+    """Retorna lista de (token, chat_id) para todos los destinos configurados."""
+    destinos = []
+    token_principal = config["telegram_token"]
+    for cid in config["telegram_chat_ids"]:
+        destinos.append((token_principal, cid))
+    destinos.extend(config.get("telegram_destinos_extra", []))
+    return destinos
+
 def obtener_configuracion() -> dict:
     cargar_env()
     return {
         "telegram_token": os.getenv("TELEGRAM_TOKEN", "").strip(),
-        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        "telegram_chat_ids": [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()],
+        # Soporte para destinos adicionales (otros bots)
+        "telegram_destinos_extra": _parsear_destinos_extra(),
         "dry_run": valor_env_bool("DRY_RUN", False),
         "run_once": valor_env_bool("RUN_ONCE", False),
         "use_browser_fallback": valor_env_bool("USE_BROWSER_FALLBACK", False),
@@ -200,6 +247,8 @@ def obtener_configuracion() -> dict:
         "browser_profile_dir": os.getenv("BROWSER_PROFILE_DIR", ".browser-profile").strip() or ".browser-profile",
         "browser_channel": os.getenv("BROWSER_CHANNEL", "").strip() or None,
         "browser_executable_path": os.getenv("BROWSER_EXECUTABLE_PATH", "").strip(),
+        "gemini_api_key": os.getenv("GEMINI_API_KEY", "").strip(),
+        "groq_api_key": os.getenv("GROQ_API_KEY", "").strip(),
     }
 
 def cargar_ofertas_enviadas() -> Set[str]:
@@ -404,16 +453,14 @@ def cumple_specs_detalladas(detalle: dict, categoria: dict) -> Tuple[bool, str]:
         if ssd_gb is not None and ssd_gb < 240:
             return False, "sin_ram_ssd"
 
-    # Si no hay info en item specifics, revisar texto completo
-    if not ram_str and not ssd_str:
+    # Si falta RAM o SSD en item specifics, revisar texto completo
+    if not ram_str or not ssd_str:
         if not cumple_especificaciones_almacenamiento(texto_completo):
             return False, "sin_ram_ssd"
 
-    # Verificar chatarra en descripción completa
-    if not es_titulo_valido(texto_completo):
-        return False, "chatarra"
-
-    # Verificar red flags de descripción (frases complejas)
+    # Verificar red flags de descripción (componentes faltantes)
+    # NO aplicar EXCLUSION_PATTERN aquí — contiene palabras cosméticas
+    # ("chipped", "scratches") que aparecen en plantillas de vendedores legítimos.
     if DESCRIPTION_RED_FLAGS.search(texto_completo):
         return False, "chatarra"
 
@@ -428,18 +475,88 @@ def verificar_descripcion_limpia(config: dict, item_id: str) -> Tuple[bool, str]
 
     texto = extraer_texto_enriquecido(detalle)
 
-    # Verificar exclusión general
-    if not es_titulo_valido(texto):
-        match = EXCLUSION_PATTERN.search(texto)
-        palabra = match.group(0) if match else "?"
-        return False, f"desc: {palabra}"
-
-    # Verificar red flags de descripción
+    # Solo verificar red flags de descripción (componentes faltantes)
+    # NO usar EXCLUSION_PATTERN aquí — tiene palabras cosméticas que aparecen
+    # en plantillas estándar de vendedores legítimos como Regency Technologies.
     match = DESCRIPTION_RED_FLAGS.search(texto)
     if match:
         return False, f"desc: {match.group(0)[:40]}"
 
     return True, "ok"
+
+# --- IA: ANÁLISIS INTELIGENTE (Groq + Gemini fallback) ---
+_PROMPT_LAPTOP = """Analiza este listing de eBay y decide si es una LAPTOP VÁLIDA para compra/reventa.
+
+TÍTULO: {titulo}
+PRECIO: ${precio:.2f}
+CONDICIÓN: {condition}
+
+ESPECIFICACIONES:
+{specs_text}
+
+DESCRIPCIÓN: {desc_text}
+
+CRITERIOS OBLIGATORIOS (todos deben cumplirse):
+1. Es una LAPTOP COMPLETA (no motherboard, no pieza suelta, no accesorio)
+2. Procesador MODERNO: Intel 11th Gen+ O AMD Ryzen 4000+
+3. RAM >= 16GB (o no especificada pero probable por el modelo)
+4. SSD/HDD >= 256GB (o no especificado pero probable por el modelo)
+5. NO está marcada como "for parts", "broken", "not working"
+6. Incluye cargador/power adapter (o al menos no dice explícitamente que falta)
+7. La condición física es aceptable (daño cosmético menor OK, daño funcional NO)
+
+Responde SOLO con una palabra: ACEPTAR o RECHAZAR"""
+
+def _llamar_groq(api_key: str, prompt: str) -> str:
+    """Llama a Groq API (Llama 3.3 70B) — ultra rápido y gratuito."""
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": "meta-llama/llama-4-scout-17b-16e-instruct", "messages": [{"role": "user", "content": prompt}],
+              "max_tokens": 10, "temperature": 0.1},
+        timeout=15
+    )
+    if resp.status_code != 200:
+        return ""
+    return resp.json()["choices"][0]["message"]["content"].strip().upper()
+
+def _llamar_gemini(api_key: str, prompt: str) -> str:
+    """Llama a Gemini Flash — fallback si Groq falla."""
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 10}},
+        timeout=15
+    )
+    if resp.status_code != 200:
+        return ""
+    return resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip().upper()
+
+def analizar_con_gemini(config: dict, titulo: str, detalle: dict, precio: float) -> str:
+    """Evalúa un listing con IA. Usa Groq (primario) o Gemini (fallback)."""
+    groq_key = config.get("groq_api_key", "")
+    gemini_key = config.get("gemini_api_key", "")
+    if not groq_key and not gemini_key:
+        return "RECHAZAR"
+
+    try:
+        specs = detalle.get("localizedAspects", [])
+        specs_text = "\n".join(f"  {s['name']}: {s['value']}" for s in specs if s.get("name"))
+        desc_text = (detalle.get("shortDescription") or "")[:300]
+        condition = detalle.get("condition", "Unknown")
+        prompt = _PROMPT_LAPTOP.format(titulo=titulo, precio=precio, condition=condition, specs_text=specs_text, desc_text=desc_text)
+
+        # Intentar Groq primero (más rápido, tiene cuota)
+        text = ""
+        if groq_key:
+            text = _llamar_groq(groq_key, prompt)
+        # Fallback a Gemini si Groq no respondió
+        if not text and gemini_key:
+            text = _llamar_gemini(gemini_key, prompt)
+
+        return "ACEPTAR" if "ACEPTAR" in text else "RECHAZAR"
+    except Exception as e:
+        print(f"    [🤖] Error IA: {e}")
+        return "RECHAZAR"
 
 def normalizar_enlace_ebay(enlace: str, base_url: str) -> str:
     enlace = enlace.strip()
@@ -592,7 +709,10 @@ def extraer_oferta_desde_item(item: Tag, base_url: str, categoria: dict, max_pre
     es_subasta = bool(time_tag)
     tiempo_restante = time_tag.get_text(strip=True) if es_subasta else ""
 
-    return OfertaLaptop(categoria["nombre"], estado, titulo, precio, precio_texto, enlace, imagen_url, es_subasta, tiempo_restante), "ok"
+    return OfertaLaptop(
+        categoria["nombre"], estado, titulo, precio, precio_texto,
+        enlace, imagen_url, es_subasta, tiempo_restante, ""
+    ), "ok"
 
 # --- TELEGRAM ---
 def enviar_telegram_texto(token: str, chat_id: str, mensaje: str) -> None:
@@ -611,6 +731,13 @@ def enviar_telegram_foto(token: str, chat_id: str, oferta: OfertaLaptop) -> None
         f"⚙️ <b>CPU:</b> {oferta.procesador}\n"
         f"💰 <b>Precio:</b> {html.escape(oferta.precio_texto)}\n"
     )
+    
+    vendedor_limpio = oferta.vendedor.strip()
+    if vendedor_limpio:
+        if vendedor_limpio.lower() == "regencytechnologies":
+            caption += f"⭐ <b>Vendedor:</b> {html.escape(vendedor_limpio)} (¡Prioridad!)\n"
+        else:
+            caption += f"🏢 <b>Vendedor:</b> {html.escape(vendedor_limpio)}\n"
     
     if oferta.es_subasta:
         caption += f"⏳ <b>SUBASTA:</b> {oferta.tiempo_restante} restantes\n"
@@ -723,8 +850,14 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
 
         price_obj = it.get("price") or {}
         currency = price_obj.get("currency") or config["ebay_currency"]
-        try: precio = float(price_obj.get("value"))
-        except: continue
+        precio_raw = price_obj.get("value")
+        # Subastas puras no tienen "price" — usar currentBidPrice como fallback
+        if precio_raw is None:
+            bid_price = it.get("currentBidPrice", {}).get("value")
+            precio_raw = bid_price
+        try: precio = float(precio_raw)
+        except: precio = 0.01  # Subastas sin precio conocido → aceptar para no perderlas
+        precio_texto = f"{currency} {precio:.2f}" if precio > 0.01 else f"{currency} (subasta)"
         if precio > config["max_precio"]:
             rechazos["precio_alto"] += 1
             if len(ejemplos_rechazo["precio_alto"]) < MAX_EJEMPLOS:
@@ -748,7 +881,7 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
 
         item_data = {
             "item_id": it.get("itemId", ""),
-            "titulo": titulo, "precio": precio, "precio_texto": f"{currency} {precio:.2f}",
+            "titulo": titulo, "precio": precio, "precio_texto": precio_texto,
             "enlace": enlace,
             "estado": (it.get("condition") or "No especificado").strip() or "No especificado",
             "imagen_url": it.get("image", {}).get("imageUrl", ""),
@@ -792,6 +925,7 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
             categoria["nombre"], cand["estado"], cand["titulo"],
             cand["precio"], cand["precio_texto"], cand["enlace"],
             cand["imagen_url"], es_subasta, tiempo_restante,
+            cand.get("seller", "")
         ))
 
     # Items que no se pudieron verificar (exceso de límite) → aceptar por título
@@ -802,10 +936,12 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
             categoria["nombre"], cand["estado"], cand["titulo"],
             cand["precio"], cand["precio_texto"], cand["enlace"],
             cand["imagen_url"], es_subasta, tiempo_restante,
+            cand.get("seller", "")
         ))
 
     # ══════════════════════════════════════════════════════════════════════
     # PASE 3: Rescatar items que FALLARON título (verificación completa)
+    #         Con Gemini AI como segundo filtro inteligente
     # ══════════════════════════════════════════════════════════════════════
     rescatados = 0
     verificados_rescate = 0
@@ -829,6 +965,14 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
 
         pasa, razon = cumple_specs_detalladas(detalle, categoria)
 
+        # Si el regex lo rechaza pero tiene Gemini disponible, pedir segunda opinión
+        if not pasa and config.get("gemini_api_key"):
+            veredicto_ia = analizar_con_gemini(config, cand["titulo"], detalle, cand["precio"])
+            if veredicto_ia == "ACEPTAR":
+                pasa = True
+                razon = "ok"
+                print(f"    [🤖] Gemini RESCATÓ: {cand['titulo'][:60]}")
+
         if pasa:
             es_subasta = "AUCTION" in cand["buying_options"]
             tiempo_restante = calcular_tiempo_restante(cand["item_end_date"]) if es_subasta else ""
@@ -837,6 +981,7 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
                 categoria["nombre"], cand["estado"], titulo_det,
                 cand["precio"], cand["precio_texto"], cand["enlace"],
                 cand["imagen_url"], es_subasta, tiempo_restante,
+                cand.get("seller", "")
             ))
             rescatados += 1
         else:
@@ -875,7 +1020,9 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
         print(f"      -> 🔍 {rescatados} RESCATADOS gracias a descripción/specs ({verificados_rescate} verificados)")
     print(f"      -> ✅ {len(ofertas)} pasaron TODOS los filtros.")
     if ofertas:
-        print("         " + "\n         ".join(f"🟢 {o.titulo} -> {o.precio_texto}" for o in ofertas))
+        for o in ofertas:
+            seller_tag = f" [⭐ {o.vendedor}]" if o.vendedor.lower() == "regencytechnologies" else (f" [{o.vendedor}]" if o.vendedor else "")
+            print(f"         🟢 {o.titulo} -> {o.precio_texto}{seller_tag}")
 
     ofertas.sort(key=lambda x: x.precio)
     return ofertas
@@ -923,6 +1070,119 @@ def buscar_ofertas_categoria_scraping(browser: Optional[EbayBrowser], config: di
 def dormir_entre_busquedas(config: dict) -> None:
     time.sleep(random.uniform(config["sleep_min_seconds"], config["sleep_max_seconds"]))
 
+# --- VENDEDORES PRIORITARIOS ---
+VENDEDORES_PRIORITARIOS = ["regencytechnologies"]
+
+def buscar_vendedores_prioritarios(config: dict, enlaces_excluidos: Set[str]) -> List[OfertaLaptop]:
+    """Busca directamente en las tiendas de vendedores prioritarios.
+    Esto asegura que atrapemos TODAS sus publicaciones, no solo las que
+    eBay decide mostrar en búsquedas genéricas."""
+    todas_ofertas: List[OfertaLaptop] = []
+
+    for vendedor in VENDEDORES_PRIORITARIOS:
+        print(f"\n[⭐] Monitoreando tienda de vendedor prioritario: {vendedor}...")
+        try:
+            token = obtener_token_ebay_app(config)
+            headers = {
+                "Authorization": f"Bearer {token}", "Accept": "application/json",
+                "X-EBAY-C-MARKETPLACE-ID": config["ebay_marketplace_id"],
+            }
+            # Buscar laptops del vendedor en la categoría Laptops & Netbooks
+            filtros = (
+                f"conditionIds:{{1000|1500|2000|2501|2502|2500|3000}},"
+                f"buyingOptions:{{FIXED_PRICE|BEST_OFFER|AUCTION}},"
+                f"sellers:{{{vendedor}}}"
+            )
+            items_vistos = set()
+            items = []
+            for sort_method in ["newlyListed", "price"]:
+                for offset in ["0", "200"]:
+                    params = {
+                        "q": "laptop",
+                        "category_ids": "175672",
+                        "limit": "200",
+                        "offset": offset,
+                        "sort": sort_method,
+                        "filter": filtros,
+                    }
+                    resp = requests.get(
+                        "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                        headers=headers, params=params, timeout=30
+                    )
+                    data = resp.json()
+                    summaries = data.get("itemSummaries") or []
+                    for it in summaries:
+                        item_id = it.get("itemId", "")
+                        if item_id and item_id not in items_vistos:
+                            items_vistos.add(item_id)
+                            items.append(it)
+                    time.sleep(0.3)
+                    if len(summaries) < 200:
+                        break
+
+            aceptados = 0
+            rechazados_total = 0
+            for it in items:
+                titulo = (it.get("title") or "").strip()
+                if not titulo or not es_titulo_valido(titulo):
+                    rechazados_total += 1
+                    continue
+
+                # Precio (con soporte para subastas sin precio)
+                price_obj = it.get("price") or {}
+                currency = price_obj.get("currency") or config["ebay_currency"]
+                precio_raw = price_obj.get("value")
+                if precio_raw is None:
+                    bid_price = it.get("currentBidPrice", {}).get("value")
+                    precio_raw = bid_price
+                try: precio = float(precio_raw)
+                except: precio = 0.01
+                precio_texto = f"{currency} {precio:.2f}" if precio > 0.01 else f"{currency} (subasta)"
+
+                enlace = normalizar_enlace_ebay((it.get("itemWebUrl") or "").strip(), config["ebay_site"])
+                if not enlace or enlace in enlaces_excluidos:
+                    continue
+
+                # Verificar generación en CUALQUIER categoría
+                gen_ok = False
+                cat_match = None
+                for cat in CATEGORIAS_BUSQUEDA:
+                    ok, explicita = es_generacion_valida(titulo, cat)
+                    if ok:
+                        gen_ok = True
+                        cat_match = cat
+                        break
+                    elif explicita:
+                        break  # Explícitamente vieja, no seguir
+
+                if not gen_ok:
+                    rechazados_total += 1
+                    continue
+
+                if not cumple_especificaciones_almacenamiento(titulo):
+                    rechazados_total += 1
+                    continue
+
+                es_subasta = "AUCTION" in it.get("buyingOptions", [])
+                tiempo_restante = calcular_tiempo_restante(it.get("itemEndDate", "")) if es_subasta else ""
+                seller = it.get("seller", {}).get("username", vendedor)
+
+                todas_ofertas.append(OfertaLaptop(
+                    cat_match["nombre"] if cat_match else "?",
+                    (it.get("condition") or "Used").strip(),
+                    titulo, precio, precio_texto, enlace,
+                    it.get("image", {}).get("imageUrl", ""),
+                    es_subasta, tiempo_restante, seller
+                ))
+                aceptados += 1
+
+            print(f"  [⭐] {vendedor}: {len(items)} items encontrados, {aceptados} pasaron filtros, {rechazados_total} rechazados.")
+
+        except Exception as e:
+            print(f"  [!] Error monitoreando {vendedor}: {e}")
+
+    return todas_ofertas
+
 # --- LÓGICA PRINCIPAL AGRUPADA ---
 def ejecutar_ciclo(config: dict, browser: Optional[EbayBrowser]) -> bool:
     enviadas = cargar_ofertas_enviadas()
@@ -931,6 +1191,32 @@ def ejecutar_ciclo(config: dict, browser: Optional[EbayBrowser]) -> bool:
 
     print("Iniciando busqueda agrupada por marca hacia Telegram...")
 
+    # ═══════════════════════════════════════════════════════════════
+    # PASO 0: Monitorear vendedores prioritarios (ej: regencytechnologies)
+    # ═══════════════════════════════════════════════════════════════
+    ofertas_prioritarias = buscar_vendedores_prioritarios(config, enviadas | reportadas_en_ciclo)
+    if ofertas_prioritarias:
+        ofertas_prioritarias.sort(key=lambda x: x.precio)
+        print(f"\n  [⭐] {len(ofertas_prioritarias)} ofertas de vendedores prioritarios. Enviando a Telegram...")
+
+        if not config["dry_run"]:
+            encabezado = f"⭐ <b>VENDEDORES PRIORITARIOS | {len(ofertas_prioritarias)} OFERTAS</b> ⭐"
+            for tok, cid in _todos_los_destinos(config):
+                enviar_telegram_texto(tok, cid, encabezado)
+            time.sleep(1)
+
+            for oferta in ofertas_prioritarias:
+                for tok, cid in _todos_los_destinos(config):
+                    enviar_telegram_foto(tok, cid, oferta)
+                reportadas_en_ciclo.add(oferta.enlace)
+                time.sleep(1.5)
+
+            enviadas.update(reportadas_en_ciclo)
+            hubo_ofertas = True
+
+    # ═══════════════════════════════════════════════════════════════
+    # PASO 1: Búsqueda normal por marca + categoría
+    # ═══════════════════════════════════════════════════════════════
     for marca in config["marcas"]:
         print(f"\n[*] Recolectando ofertas para la marca: {marca.upper()}...")
         ofertas_marca_acumuladas = []
@@ -952,17 +1238,20 @@ def ejecutar_ciclo(config: dict, browser: Optional[EbayBrowser]) -> bool:
                 time.sleep(5)
 
         if ofertas_marca_acumuladas:
-            ofertas_marca_acumuladas.sort(key=lambda x: x.precio)
+            # Ordenar primero por vendedor (regencytechnologies), luego por precio
+            ofertas_marca_acumuladas.sort(key=lambda x: (x.vendedor.lower() != "regencytechnologies", x.precio))
             
             print(f"  [+] {len(ofertas_marca_acumuladas)} oferta(s) encontradas. Enviando a Telegram...")
             
             if not config["dry_run"]:
                 encabezado = f"🔥 <b>TOP {len(ofertas_marca_acumuladas)} ENCONTRADAS | {marca.upper()}</b> 🔥"
-                enviar_telegram_texto(config["telegram_token"], config["telegram_chat_id"], encabezado)
+                for tok, cid in _todos_los_destinos(config):
+                    enviar_telegram_texto(tok, cid, encabezado)
                 time.sleep(1)
                 
                 for oferta in ofertas_marca_acumuladas:
-                    enviar_telegram_foto(config["telegram_token"], config["telegram_chat_id"], oferta)
+                    for tok, cid in _todos_los_destinos(config):
+                        enviar_telegram_foto(tok, cid, oferta)
                     reportadas_en_ciclo.add(oferta.enlace)
                     time.sleep(1.5) 
                 
@@ -977,7 +1266,7 @@ def ejecutar_ciclo(config: dict, browser: Optional[EbayBrowser]) -> bool:
 
 def main() -> None:
     config = obtener_configuracion()
-    if not config["telegram_token"] or not config["telegram_chat_id"]:
+    if not config["telegram_token"] or not config["telegram_chat_ids"]:
         print("❌ Error: Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en el archivo .env")
         return
 
