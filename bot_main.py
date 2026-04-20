@@ -33,8 +33,8 @@ def ejecutar_ciclo(config: dict, browser: Optional[EbayBrowser]) -> bool:
     analizador_vis = None
     if config.get("supabase_url") and config.get("supabase_service_key"):
         sb_client = SupabaseClient(config["supabase_url"], config["supabase_service_key"])
+        analizador_rent = AnalizadorRentabilidad(config.get("groq_api_key", ""), sb_client)
         if config.get("groq_api_key"):
-            analizador_rent = AnalizadorRentabilidad(config.get("groq_api_key"), sb_client)
             analizador_vis = AnalizadorVisual(config.get("groq_api_key"))
 
     print("Iniciando búsqueda agrupada por marca hacia Telegram...")
