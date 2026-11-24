@@ -23,10 +23,8 @@ ESTADOS_BUSQUEDA = [
 ]
 
 CATEGORIAS_BUSQUEDA = [
-    {"id": "175672", "nombre": "Intel Core i3", "terminos": ["i3", "intel core i3", "core i3"]},
     {"id": "175672", "nombre": "Intel Core i5", "terminos": ["i5", "intel core i5", "core i5"]},
     {"id": "175672", "nombre": "Intel Core i7", "terminos": ["i7", "intel core i7", "core i7"]},
-    {"id": "175672", "nombre": "Ryzen 3", "terminos": ["ryzen 3"]},
     {"id": "175672", "nombre": "Ryzen 5", "terminos": ["ryzen 5"]},
     {"id": "175672", "nombre": "Ryzen 7", "terminos": ["ryzen 7"]},
     {"id": "175672", "nombre": "Ryzen 9", "terminos": ["ryzen 9"]},

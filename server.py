@@ -1271,7 +1271,7 @@ async def get_bot_config():
     process_alive = _is_bot_alive()
     
     default_filters = {
-        "categorias_activas": ["Intel Core i5", "Intel Core i7", "Intel Core i9", "Ryzen 3", "Ryzen 5", "Ryzen 7", "Ryzen 9", "Intel Core i3"],
+        "categorias_activas": ["Intel Core i5", "Intel Core i7", "Intel Core i9", "Ryzen 5", "Ryzen 7", "Ryzen 9"],
         "estados_activos": ["New", "Open box", "Certified Refurbished", "Excellent Refurbished", "Very Good Refurbished", "Good Refurbished", "Used"]
     }
     

@@ -5,7 +5,8 @@
     "Certified Refurbished",
     "Excellent Refurbished",
     "Very Good Refurbished",
-    "Good Refurbished"
+    "Good Refurbished",
+    "Used"
   ],
   "categorias_activas": [
     "Intel Core i5",
@@ -13,9 +14,7 @@
     "Intel Core i9",
     "Ryzen 5",
     "Ryzen 7",
-    "Ryzen 9",
-    "Intel Core i3",
-    "Ryzen 3"
+    "Ryzen 9"
   ],
   "tiendas_activas": [
     "eBay",
