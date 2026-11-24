@@ -1,0 +1,30 @@
+{
+  "estados_activos": [
+    "New",
+    "Open box",
+    "Certified Refurbished",
+    "Excellent Refurbished",
+    "Very Good Refurbished",
+    "Good Refurbished"
+  ],
+  "categorias_activas": [
+    "Intel Core i5",
+    "Intel Core i7",
+    "Intel Core i9",
+    "Ryzen 5",
+    "Ryzen 7",
+    "Ryzen 9",
+    "Intel Core i3",
+    "Ryzen 3"
+  ],
+  "tiendas_activas": [
+    "eBay",
+    "Amazon",
+    "BackMarket",
+    "Newegg",
+    "Mercari"
+  ],
+  "combinar_resultados": true,
+  "min_vendedor_ventas": 1000
+}
+

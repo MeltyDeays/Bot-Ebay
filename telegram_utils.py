@@ -6,9 +6,11 @@ def enviar_telegram_texto(token: str, chat_id: str, mensaje: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "HTML", "disable_web_page_preview": True}
     try: 
-        requests.post(url, json=payload, timeout=30)
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code != 200:
+            print(f"[TELEGRAM] Error enviando texto: HTTP {resp.status_code} — {resp.text[:300]}")
     except Exception as e: 
-        print(f"Error enviando telegram texto: {e}")
+        print(f"[TELEGRAM] Excepcion enviando texto: {e}")
 
 def enviar_telegram_foto(token: str, chat_id: str, oferta: Any, rentabilidad: Dict = None, etiqueta_especial: str = None) -> None:
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
@@ -59,7 +61,8 @@ def enviar_telegram_foto(token: str, chat_id: str, oferta: Any, rentabilidad: Di
         caption += f"\n{emoji} <b>Margen est. (NIC):</b> ${margen} ({pct}%)\n"
         caption += f"🏷️ <b>Venta en NIC:</b> ~${venta}\n"
         
-    caption += f"\n🔗 <a href='{enlace}'>COMPRAR EN EBAY</a>"
+    enlace_limpio = html.escape(enlace) if enlace else ""
+    caption += f"\n🔗 <a href='{enlace_limpio}'>COMPRAR EN EBAY</a>"
     
     if not imagen:
         enviar_telegram_texto(token, chat_id, caption)
@@ -68,7 +71,10 @@ def enviar_telegram_foto(token: str, chat_id: str, oferta: Any, rentabilidad: Di
     payload = {"chat_id": chat_id, "photo": imagen, "caption": caption, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            print(f"[TELEGRAM] Error enviando foto: HTTP {resp.status_code} — {resp.text[:300]}")
+            print(f"[TELEGRAM] Reintentando como texto...")
+            enviar_telegram_texto(token, chat_id, caption)
     except Exception as e:
-        print(f"Error enviando foto a telegram, enviando como texto. Error: {e}")
+        print(f"[TELEGRAM] Excepcion enviando foto, reintentando como texto. Error: {e}")
         enviar_telegram_texto(token, chat_id, caption)

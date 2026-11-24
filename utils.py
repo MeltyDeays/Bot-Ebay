@@ -1,9 +1,23 @@
 import re
 import json
 import os
+import html
 from urllib.parse import quote_plus, urljoin, urlparse, urlunparse
 from datetime import datetime, timezone
 from typing import Optional, Set, Any, Tuple
+from bs4 import BeautifulSoup
+from cpu_rules import es_cpu_moderna, es_cpu_obsoleta
+
+# Constantes de Filtrado
+EXCLUSION_PATTERN = re.compile(
+    r"\b(?:screen protector|screen filter|anti glare|protective film|tempered glass|laptop skin|decal|sticker|protector|motherboard|motherboards|mainboard|board|lcd|screen|display|panel|case|cover|bezel|hinge|keyboard|battery|charger|adapter|cable|fan|heatsink|cooler|speaker|webcam|camera|touchpad|trackpad|palmrest|chassis|housing|part|parts|repair|for parts|not working|broken|defective|damaged|salvage|scrap|as is|untested|powers on only|no post|no boot|no display|cracked|smashed|missing|water damage|liquid damage|password locked|bios locked|icloud locked|activation locked|mdm locked|computrace|empty box|box only|bushing|machinery|plc|industrial|router|server|switch|docking station|dock|barebone|bare bone|no ram|no hdd|no ssd|no hard drive|no hard disk|no cpu|no os|lot of|bundle of|caddy|logic board|system board|daughterboard|dc jack|flex cable|top case|bottom case|back cover|digitizer)\b",
+    re.IGNORECASE,
+)
+
+DESCRIPTION_RED_FLAGS = re.compile(
+    r"\b(?:missing|without|no)\s+(?:battery|charger|ram|ssd|hdd|hard drive|caddy|screen|display|keyboard|keys|bottom|cover|bezel|screws|wifi|camera|webcam)\b|\b(?:cracked|broken|damaged|smashed|shattered|chipped|dented|bent|warped|scratched heavily|heavy scratches|deep scratches|scuffs|blemishes|spots|bruises|pressure marks|white spots|dead pixels|lines on screen)\b|\b(?:password locked|bios locked|computrace|mdm|icloud locked|activation locked)\b|\b(?:for parts|repair only|not working|as is|untested|powers on only|no boot|no post|no display|water damage|liquid damage)\b",
+    re.IGNORECASE,
+)
 
 DB_LOCAL = 'ofertas_enviadas.json'
 
@@ -58,9 +72,11 @@ def extraer_precio(texto: str) -> Optional[float]:
 def limpiar_texto(texto: str) -> str: return re.sub(r"\s+", " ", html.unescape(texto)).strip()
 
 def es_titulo_valido(titulo: str) -> bool:
-    return not bool(EXCLUSION_PATTERN.search(titulo))
+    t = re.sub(r'[-_/]', ' ', str(titulo or ''))
+    t = re.sub(r'\s+', ' ', t).strip()
+    return not bool(EXCLUSION_PATTERN.search(t))
 
-def es_generacion_valida(titulo: str, categoria: dict) -> bool:
+def es_generacion_valida(titulo: str, categoria: dict) -> Tuple[bool, bool]:
     t = titulo.lower()
 
     # --- Limpieza de ruido antes de analizar ---
@@ -70,41 +86,15 @@ def es_generacion_valida(titulo: str, categoria: dict) -> bool:
     t = re.sub(r'[-_/]', ' ', t)
     t = re.sub(r'\s+', ' ', t).strip()
 
-    nombre_cat = categoria["nombre"].lower()
+    if es_cpu_obsoleta(t):
+        return False, True
+    if es_cpu_moderna(t):
+        return True, True
 
-    # 1. RECHAZAR GENERACIONES EXPLICITAMENTE MALAS PRIMERO (Ahorra API calls y evita falsos positivos en el fallback)
-    if "ryzen" in nombre_cat or "amd" in nombre_cat:
-        # Generación MALA explícita: 1xxx-3xxx
-        if re.search(r'\b[123]\d{3}[a-z]*\b', t): return False, True
-        # Athlon o A-Series (A9, A12, etc.)
-        if re.search(r'\bathlon\b|\ba\d{1,2}\b', t): return False, True
-
-    if "intel" in nombre_cat or "i" in nombre_cat:
-        # Generaciones explícitamente viejas (1st-10th)
-        if re.search(r'\b[1-9]th\b|\b10th\b|\b[1-3]rd\b|\b[1-2]nd\b|\b1st\b', t): return False, True
-        if re.search(r'\bgen\s*[1-9]\b|\bgen\s*10\b|\b[1-9]\s*gen\b|\b10\s*gen\b', t): return False, True
-        # Número de modelo Intel malo (3/4 dígitos viejos o 10xxx)
-        if re.search(r'\b\d{3,4}[a-z]?\d?\b', t) or re.search(r'\b10\d{2,3}[a-z]?\d?\b', t): return False, True
-
-    # 2. Verificar que el término de la categoría esté en el título
-    # Si no está, no podemos asegurar que sea buena, va a rescate.
-    if not any(termino in t for termino in categoria["terminos"]):
+    # Verificar término de categoría
+    if not any(termino in t for termino in categoria.get("terminos", ["laptop", "notebook", "pc"])):
         return False, False
 
-    # 3. VERIFICAR GENERACIONES BUENAS
-    if "ryzen" in nombre_cat:
-        # Generación BUENA: 4xxx–8xxx
-        if re.search(r'\b[45678]\d{3}[a-z]*\b', t): return True, True
-        
-    if "intel" in nombre_cat or "i" in nombre_cat:
-        # Core Ultra siempre válido
-        if re.search(r'\bultra\s*[579]\b', t) or (re.search(r'\b[12]\d{2}[a-z]+\b', t) and 'ultra' in t): return True, True
-        # Generación explícita buena (11th–15th)
-        if re.search(r'\b1[12345]th\b|\bgen\s*1[12345]\b|\b1[12345]\s*gen\b', t): return True, True
-        # Número de modelo Intel bueno (11xx–15xx)
-        if re.search(r'\b1[12345]\d{2,3}[a-z]?\d?\b', t): return True, True
-
-    # Sin modelo explícito (ej. solo "Ryzen 5" o "Core i7")
     return False, False
 
 def cumple_especificaciones_almacenamiento(titulo: str) -> bool:
@@ -219,23 +209,7 @@ def cumple_specs_detalladas(detalle: dict, categoria: dict) -> Tuple[bool, str]:
 
     return True, "ok"
 
-def verificar_descripcion_limpia(config: dict, item_id: str) -> Tuple[bool, str]:
-    """Verificación LIGERA: solo checa red flags en la descripción.
-    Para items que ya pasaron el filtro de título (gen + specs OK)."""
-    detalle = obtener_detalle_item_api(config, item_id)
-    if not detalle:
-        return True, "ok"  # Sin detalle = aceptar (ya pasó título)
 
-    texto = extraer_texto_enriquecido(detalle)
-
-    # Solo verificar red flags de descripción (componentes faltantes)
-    # NO usar EXCLUSION_PATTERN aquí — tiene palabras cosméticas que aparecen
-    # en plantillas estándar de vendedores legítimos como Regency Technologies.
-    match = DESCRIPTION_RED_FLAGS.search(texto)
-    if match:
-        return False, f"desc: {match.group(0)[:40]}"
-
-    return True, "ok"
 
 def normalizar_enlace_ebay(enlace: str, base_url: str) -> str:
     enlace = enlace.strip()

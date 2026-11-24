@@ -7,8 +7,9 @@ import random
 from typing import Set, List, Optional, Tuple, Dict, Any
 from bs4 import BeautifulSoup, Tag
 from models import OfertaLaptop
-from utils import calcular_tiempo_restante, extraer_precio, limpiar_texto, es_titulo_valido, es_generacion_valida, cumple_especificaciones_almacenamiento, normalizar_enlace_ebay
-from config import CATEGORIAS_BUSQUEDA, ESTADOS_BUSQUEDA, MARCAS_SOPORTADAS
+from utils import calcular_tiempo_restante, extraer_precio, limpiar_texto, es_titulo_valido, es_generacion_valida, cumple_especificaciones_almacenamiento, normalizar_enlace_ebay, EXCLUSION_PATTERN, cumple_specs_detalladas, extraer_texto_enriquecido, DESCRIPTION_RED_FLAGS
+from config import CATEGORIAS_BUSQUEDA, ESTADOS_BUSQUEDA, MARCAS_SOPORTADAS, MAX_VERIFY_CHECKS, MAX_RESCUE_CHECKS, MAX_WORKERS_AI, MAX_EJEMPLOS
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -20,6 +21,13 @@ except (ImportError, ModuleNotFoundError):
     Playwright = None
 
 _EBAY_TOKEN_CACHE: dict = {}
+_DIRECT_HTTP_SESSION = requests.Session()
+_DIRECT_HTTP_SESSION.trust_env = False
+
+# Vendedores que el bot monitorea directamente (búsqueda por tienda)
+VENDEDORES_PRIORITARIOS = [
+    "regencytechnologies",
+]
 
 class EbayChallengeError(Exception):
     pass
@@ -59,7 +67,7 @@ def obtener_html_publico(url: str, max_reintentos: int) -> str:
     ultimo_error: Optional[Exception] = None
     for intento in range(max_reintentos):
         try:
-            respuesta = requests.get(url, headers=obtener_headers_publicos(), timeout=30)
+            respuesta = _DIRECT_HTTP_SESSION.get(url, headers=obtener_headers_publicos(), timeout=30)
             respuesta.raise_for_status()
             return respuesta.text
         except requests.RequestException as error:
@@ -115,6 +123,73 @@ def _ebay_basic_auth_header(client_id: str, client_secret: str) -> str:
     cred = f"{client_id}:{client_secret}".encode("utf-8")
     return "Basic " + base64.b64encode(cred).decode("ascii")
 
+def analizar_con_ia(config: dict, titulo: str, detalle: dict, precio: float) -> str:
+    """Implementación base para analizar rescate usando IA (Gemini o Groq Llama 3)."""
+    try:
+        import requests
+        
+        texto = extraer_texto_enriquecido(detalle)
+
+        # Cargar base de conocimiento de ejemplos rechazados ("Equivocado")
+        ejemplos_negativos_str = ""
+        json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ejemplos_equivocados.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    bad_list = json.load(f)[-5:]
+                    if bad_list:
+                        ejemplos_negativos_str = "\nEJEMPLOS INCORRECTOS RECHAZADOS ANTERIORMENTE (NO ACEPTAR SIMILARES):\n"
+                        for item in bad_list:
+                            ejemplos_negativos_str += f"- Título: '{item.get('titulo')}' | Motivo error: {item.get('motivo_error')}\n"
+            except Exception:
+                pass
+
+        prompt = f"""
+        Actúa como un experto en hardware comprando laptops usadas en eBay.
+        Título: {titulo}
+        Precio: ${precio}
+        Descripción completa y specs:
+        {texto[:1000]}
+        {ejemplos_negativos_str}
+        
+        ¿Esta laptop tiene un procesador BUENO (Core i5/i7 gen 11 o superior, o Ryzen 5/7 serie 4000 o superior), al menos 16GB RAM y al menos 256GB SSD, y NO tiene daños severos descritos en la descripción, ni coincide con los ejemplos incorrectos?
+        Responde estrictamente con "ACEPTAR" si cumple todo, o "RECHAZAR" si es basura/vieja/dañada/falta ram/ssd.
+        """
+
+        
+        # 1. Intentar Gemini
+        api_key_gemini = config.get("gemini_api_key")
+        if api_key_gemini:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key_gemini}"
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                res = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip().upper()
+                return "ACEPTAR" if "ACEPTAR" in res else "RECHAZAR"
+                
+        # 2. Fallback a Groq
+        api_key_groq = config.get("groq_api_key")
+        if api_key_groq:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key_groq}", "Content-Type": "application/json"}
+            payload = {
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 5
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                res = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip().upper()
+                return "ACEPTAR" if "ACEPTAR" in res else "RECHAZAR"
+                
+        return "RECHAZAR"
+    except Exception as e:
+        print(f"Error en IA fallback: {e}")
+        return "RECHAZAR"
+
 def obtener_token_ebay_app(config: dict) -> str:
     ahora = int(time.time())
     if _EBAY_TOKEN_CACHE.get("access_token") and ahora < _EBAY_TOKEN_CACHE.get("expires_at", 0) - 60:
@@ -130,22 +205,66 @@ def obtener_token_ebay_app(config: dict) -> str:
         "Authorization": _ebay_basic_auth_header(client_id, client_secret),
     }
     data = {"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"}
-    resp = requests.post("https://api.ebay.com/identity/v1/oauth2/token", headers=headers, data=data, timeout=30)
+    resp = _DIRECT_HTTP_SESSION.post(
+        "https://api.ebay.com/identity/v1/oauth2/token",
+        headers=headers,
+        data=data,
+        timeout=30,
+    )
     resp.raise_for_status()
     payload = resp.json()
     _EBAY_TOKEN_CACHE["access_token"] = payload["access_token"]
     _EBAY_TOKEN_CACHE["expires_at"] = ahora + int(payload.get("expires_in", 7200))
     return _EBAY_TOKEN_CACHE["access_token"]
 
+def obtener_detalle_item_api(config: dict, item_id: str) -> dict:
+    try:
+        token = obtener_token_ebay_app(config)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "X-EBAY-C-MARKETPLACE-ID": config["ebay_marketplace_id"],
+        }
+        from urllib.parse import quote
+        safe_item_id = quote(item_id)
+        url = f"https://api.ebay.com/buy/browse/v1/item/{safe_item_id}"
+        resp = _DIRECT_HTTP_SESSION.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"Error obteniendo detalle item API {item_id}: {e}")
+    return {}
+
+def verificar_descripcion_limpia(config: dict, item_id: str) -> Tuple[bool, str]:
+    """Verificación LIGERA: solo checa red flags en la descripción.
+    Para items que ya pasaron el filtro de título (gen + specs OK)."""
+    detalle = obtener_detalle_item_api(config, item_id)
+    if not detalle:
+        return True, "ok"  # Sin detalle = aceptar (ya pasó título)
+
+    texto = extraer_texto_enriquecido(detalle)
+
+    # Solo verificar red flags de descripción (componentes faltantes)
+    # NO usar EXCLUSION_PATTERN aquí — tiene palabras cosméticas que aparecen
+    # en plantillas estándar de vendedores legítimos como Regency Technologies.
+    match = DESCRIPTION_RED_FLAGS.search(texto)
+    if match:
+        return False, f"desc: {match.group(0)[:40]}"
+
+    return True, "ok"
+
 def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enlaces_excluidos: Set[str]) -> List[OfertaLaptop]:
     nombre_limpio = categoria['nombre'].replace("Intel ", "").strip()
     encabezado = f"{marca} {categoria['nombre']}"
     q = f"{marca} {nombre_limpio}"
-    print(f"\n[?] (API) Buscando: {encabezado}... Q: {q}")
+    print(f"\n[API] Buscando: {encabezado}... Q: {q}")
+
 
     try:
         token = obtener_token_ebay_app(config)
-        filtros = f"conditionIds:{{1000|1500|2000|2501|2502|2500|3000}},price:[..{config['max_precio']}],priceCurrency:{config['ebay_currency']},buyingOptions:{{FIXED_PRICE|BEST_OFFER|AUCTION}}"
+        estados = config.get("estados_busqueda", ESTADOS_BUSQUEDA)
+        cond_ids = "|".join([str(est["id"]) for est in estados]) if estados else "1000|1500|2000|2010|2020|2030|3000"
+        filtros = f"conditionIds:{{{cond_ids}}},price:[..{config['max_precio']}],priceCurrency:{config['ebay_currency']},buyingOptions:{{FIXED_PRICE|BEST_OFFER|AUCTION}}"
         headers = {
             "Authorization": f"Bearer {token}", "Accept": "application/json",
             "X-EBAY-C-MARKETPLACE-ID": config["ebay_marketplace_id"],
@@ -157,7 +276,12 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
         for sort_method in ["newlyListed", "price"]:
             for offset in ["0", "200"]:  # Paginación: traer hasta 400 items por sort
                 params = {"q": q, "category_ids": "175672", "limit": "200", "offset": offset, "sort": sort_method, "filter": filtros}
-                resp = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search", headers=headers, params=params, timeout=30)
+                resp = _DIRECT_HTTP_SESSION.get(
+                    "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
                 data = resp.json()
                 
                 summaries = data.get("itemSummaries") or []
@@ -185,7 +309,21 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
     # ══════════════════════════════════════════════════════════════════════
     # PASE 1: Filtro rápido por título (sin llamadas extra a la API)
     # ══════════════════════════════════════════════════════════════════════
+    from config import BLOCKED_SELLERS
+    
+    min_vendedor_ventas = config.get("min_vendedor_ventas", 1000)
+
     for it in items:
+        seller_data = it.get("seller", {})
+        vendedor = seller_data.get("username", "").strip().lower()
+        feedback_score = int(seller_data.get("feedbackScore") or 0)
+
+        if vendedor in [s.lower() for s in BLOCKED_SELLERS]:
+            continue
+
+        if min_vendedor_ventas > 0 and feedback_score > 0 and feedback_score < min_vendedor_ventas:
+            continue
+
         titulo = (it.get("title") or "").strip()
 
         if not es_titulo_valido(titulo):
@@ -210,7 +348,7 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
         if precio > config["max_precio"]:
             rechazos["precio_alto"] += 1
             if len(ejemplos_rechazo["precio_alto"]) < MAX_EJEMPLOS:
-                ejemplos_rechazo["precio_alto"].append(f'"{titulo[:60]}" → ${precio:.0f}')
+                ejemplos_rechazo["precio_alto"].append(f'"{titulo[:60]}" -> ${precio:.0f}')
             continue
 
         enlace = normalizar_enlace_ebay((it.get("itemWebUrl") or "").strip(), config["ebay_site"])
@@ -225,18 +363,26 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
             # Es explícitamente una generación vieja, rechazar de inmediato sin gastar API
             rechazos["gen_vieja"] += 1
             if len(ejemplos_rechazo["gen_vieja"]) < MAX_EJEMPLOS:
-                ejemplos_rechazo["gen_vieja"].append(f'"{titulo[:70]}" → [título: gen_vieja]')
+                ejemplos_rechazo["gen_vieja"].append(f'"{titulo[:70]}" -> [titulo: gen_vieja]')
             continue
+
+
+
+        main_img = it.get("image", {}).get("imageUrl", "")
+        add_imgs = [img.get("imageUrl") for img in it.get("additionalImages", []) if isinstance(img, dict) and img.get("imageUrl")]
+        all_imgs = ([main_img] if main_img else []) + [i for i in add_imgs if i != main_img]
 
         item_data = {
             "item_id": it.get("itemId", ""),
             "titulo": titulo, "precio": precio, "precio_texto": precio_texto,
             "enlace": enlace,
             "estado": (it.get("condition") or "No especificado").strip() or "No especificado",
-            "imagen_url": it.get("image", {}).get("imageUrl", ""),
+            "imagen_url": main_img,
+            "imagenes": all_imgs,
             "buying_options": it.get("buyingOptions", []),
             "item_end_date": it.get("itemEndDate", ""),
         }
+
 
         if titulo_pasa_gen and titulo_pasa_specs:
             candidatos_verificar.append(item_data)
@@ -252,11 +398,16 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
     rechazados_desc = 0
     max_verificar = min(len(candidatos_verificar), MAX_VERIFY_CHECKS)
     if candidatos_verificar:
-        print(f"  [🛡️] Verificando descripción de {max_verificar} items que pasaron título...")
+        print(f"  [Verificacion] Verificando descripcion de {max_verificar} items que pasaron titulo...")
+
 
     for cand in candidatos_verificar[:MAX_VERIFY_CHECKS]:
         es_subasta = "AUCTION" in cand["buying_options"]
         tiempo_restante = calcular_tiempo_restante(cand["item_end_date"]) if es_subasta else ""
+        if es_subasta and (tiempo_restante == "Terminada" or "terminad" in tiempo_restante.lower()):
+            rechazos["subasta_finalizada"] = rechazos.get("subasta_finalizada", 0) + 1
+            continue
+
         item_id = cand["item_id"]
 
         if item_id:
@@ -274,19 +425,25 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
             categoria["nombre"], cand["estado"], cand["titulo"],
             cand["precio"], cand["precio_texto"], cand["enlace"],
             cand["imagen_url"], es_subasta, tiempo_restante,
-            cand.get("seller", "")
+            cand.get("seller", ""), "", "eBay", cand.get("imagenes", [])
         ))
 
-    # Items que no se pudieron verificar (exceso de límite) → aceptar por título
+    # Items que no se pudieron verificar (exceso de límite) -> aceptar por título
     for cand in candidatos_verificar[MAX_VERIFY_CHECKS:]:
         es_subasta = "AUCTION" in cand["buying_options"]
         tiempo_restante = calcular_tiempo_restante(cand["item_end_date"]) if es_subasta else ""
+        if es_subasta and (tiempo_restante == "Terminada" or "terminad" in tiempo_restante.lower()):
+            rechazos["subasta_finalizada"] = rechazos.get("subasta_finalizada", 0) + 1
+            continue
+
         ofertas.append(OfertaLaptop(
             categoria["nombre"], cand["estado"], cand["titulo"],
             cand["precio"], cand["precio_texto"], cand["enlace"],
             cand["imagen_url"], es_subasta, tiempo_restante,
-            cand.get("seller", "")
+            cand.get("seller", ""), "", "eBay", cand.get("imagenes", [])
         ))
+
+
 
     # ══════════════════════════════════════════════════════════════════════
     # PASE 3: Rescatar items que FALLARON título (verificación completa)
@@ -296,54 +453,63 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
     verificados_rescate = 0
     max_rescatar = min(len(candidatos_rescatar), MAX_RESCUE_CHECKS)
     if candidatos_rescatar:
-        print(f"  [🔍] {len(candidatos_rescatar)} candidatos para rescate (revisando {max_rescatar})...")
+        print(f"  [Rescate] {len(candidatos_rescatar)} candidatos para rescate (revisando {max_rescatar})...")
 
-    for cand in candidatos_rescatar[:MAX_RESCUE_CHECKS]:
+    def procesar_candidato(cand):
         item_id = cand["item_id"]
         if not item_id:
-            rechazos[cand["razon_titulo"]] += 1; continue
-
-        verificados_rescate += 1
+            return cand, False, cand["razon_titulo"], "sin item_id", None, False
+        
         detalle = obtener_detalle_item_api(config, item_id)
-
         if not detalle:
-            rechazos[cand["razon_titulo"]] += 1
-            if len(ejemplos_rechazo[cand["razon_titulo"]]) < MAX_EJEMPLOS:
-                ejemplos_rechazo[cand["razon_titulo"]].append(f'"{cand["titulo"][:70]}" → [sin detalle API]')
-            continue
-
+            return cand, False, cand["razon_titulo"], "sin detalle API", None, False
+            
         pasa, razon = cumple_specs_detalladas(detalle, categoria)
-
-        # Si el regex lo rechaza pero tiene Gemini disponible, pedir segunda opinión
-        if not pasa and config.get("gemini_api_key"):
-            veredicto_ia = analizar_con_gemini(config, cand["titulo"], detalle, cand["precio"])
+        rescate_ia = False
+        
+        # Si el regex lo rechaza pero tiene IA disponible, pedir segunda opinión
+        if not pasa and (config.get("gemini_api_key") or config.get("groq_api_key")):
+            veredicto_ia = analizar_con_ia(config, cand["titulo"], detalle, cand["precio"])
             if veredicto_ia == "ACEPTAR":
                 pasa = True
                 razon = "ok"
-                print(f"    [🤖] Gemini RESCATÓ: {cand['titulo'][:60]}")
+                rescate_ia = True
+                
+        return cand, pasa, razon, "", detalle, rescate_ia
 
-        if pasa:
-            es_subasta = "AUCTION" in cand["buying_options"]
-            tiempo_restante = calcular_tiempo_restante(cand["item_end_date"]) if es_subasta else ""
-            titulo_det = (detalle.get("title") or cand["titulo"]).strip()
-            ofertas.append(OfertaLaptop(
-                categoria["nombre"], cand["estado"], titulo_det,
-                cand["precio"], cand["precio_texto"], cand["enlace"],
-                cand["imagen_url"], es_subasta, tiempo_restante,
-                cand.get("seller", "")
-            ))
-            rescatados += 1
-        else:
-            rechazos[razon] += 1
-            if len(ejemplos_rechazo[razon]) < MAX_EJEMPLOS:
-                ejemplos_rechazo[razon].append(f'"{cand["titulo"][:70]}" → [detalle: {razon}]')
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_AI) as executor:
+        futures = {executor.submit(procesar_candidato, cand): cand for cand in candidatos_rescatar[:MAX_RESCUE_CHECKS]}
+        for future in as_completed(futures):
+            cand, pasa, razon, msg, detalle, rescate_ia = future.result()
+            verificados_rescate += 1
+            
+            if rescate_ia:
+                print(f"    [IA] IA RESCATO: {cand['titulo'][:60]}")
 
-        time.sleep(0.3)
-    # Los que no se verificaron en rescate → contar como rechazo
+                
+            if pasa:
+                es_subasta = "AUCTION" in cand["buying_options"]
+                tiempo_restante = calcular_tiempo_restante(cand["item_end_date"]) if es_subasta else ""
+                titulo_det = (detalle.get("title") or cand["titulo"]).strip() if detalle else cand["titulo"].strip()
+                ofertas.append(OfertaLaptop(
+                    categoria["nombre"], cand["estado"], titulo_det,
+                    cand["precio"], cand["precio_texto"], cand["enlace"],
+                    cand["imagen_url"], es_subasta, tiempo_restante,
+                    cand.get("seller", ""), "", "eBay", cand.get("imagenes", [])
+                ))
+
+                rescatados += 1
+            else:
+                rechazos[razon] += 1
+                if len(ejemplos_rechazo[razon]) < MAX_EJEMPLOS:
+                    txt = msg if msg else f"detalle: {razon}"
+                    ejemplos_rechazo[razon].append(f'"{cand["titulo"][:70]}" -> [{txt}]')
+    # Los que no se verificaron en rescate -> contar como rechazo
     for cand in candidatos_rescatar[MAX_RESCUE_CHECKS:]:
         rechazos[cand["razon_titulo"]] += 1
         if len(ejemplos_rechazo[cand["razon_titulo"]]) < MAX_EJEMPLOS:
-            ejemplos_rechazo[cand["razon_titulo"]].append(f'"{cand["titulo"][:70]}" → [no verificado]')
+            ejemplos_rechazo[cand["razon_titulo"]].append(f'"{cand["titulo"][:70]}" -> [no verificado]')
+
 
     # ══════════════════════════════════════════════════════════════════════
     # Reporte con ejemplos de rechazos
@@ -361,17 +527,21 @@ def buscar_ofertas_categoria_api(config: dict, categoria: dict, marca: str, enla
         if count == 0: continue
         print(f"      -> {count} descartados ({etiqueta})")
         for ej in ejemplos_rechazo[razon]:
-            print(f"         · {ej}")
+            ej_safe = str(ej).encode('ascii', 'replace').decode('ascii')
+            print(f"         . {ej_safe}")
 
     if rechazados_desc > 0:
-        print(f"      -> 🛡️ {rechazados_desc} eliminados por descripción sospechosa")
+        print(f"      -> {rechazados_desc} eliminados por descripción sospechosa")
     if rescatados > 0:
-        print(f"      -> 🔍 {rescatados} RESCATADOS gracias a descripción/specs ({verificados_rescate} verificados)")
-    print(f"      -> ✅ {len(ofertas)} pasaron TODOS los filtros.")
+        print(f"      -> [RESCATE] {rescatados} RESCATADOS gracias a descripción/specs ({verificados_rescate} verificados)")
+    print(f"      -> [OK] {len(ofertas)} pasaron TODOS los filtros.")
     if ofertas:
         for o in ofertas:
-            seller_tag = f" [⭐ {o.vendedor}]" if o.vendedor.lower() == "regencytechnologies" else (f" [{o.vendedor}]" if o.vendedor else "")
-            print(f"         🟢 {o.titulo} -> {o.precio_texto}{seller_tag}")
+            seller_tag = f" [{o.vendedor}]" if o.vendedor else ""
+            t_safe = str(o.titulo).encode('ascii', 'replace').decode('ascii')
+            print(f"         + {t_safe} -> {o.precio_texto}{seller_tag}")
+
+
 
     ofertas.sort(key=lambda x: x.precio)
     return ofertas
@@ -434,8 +604,10 @@ def buscar_vendedores_prioritarios(config: dict, enlaces_excluidos: Set[str]) ->
                 "X-EBAY-C-MARKETPLACE-ID": config["ebay_marketplace_id"],
             }
             # Buscar laptops del vendedor en la categoría Laptops & Netbooks
+            estados = config.get("estados_busqueda", ESTADOS_BUSQUEDA)
+            cond_ids = "|".join([str(est["id"]) for est in estados]) if estados else "1000|1500|2000|2010|2020|2030|3000"
             filtros = (
-                f"conditionIds:{{1000|1500|2000|2501|2502|2500|3000}},"
+                f"conditionIds:{{{cond_ids}}},"
                 f"buyingOptions:{{FIXED_PRICE|BEST_OFFER|AUCTION}},"
                 f"sellers:{{{vendedor}}}"
             )

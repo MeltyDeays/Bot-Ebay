@@ -14,3 +14,7 @@ class OfertaLaptop:
     tiempo_restante: str
     vendedor: str
     procesador: str = ""
+    tienda: str = "eBay"
+    imagenes: list = None
+
+
