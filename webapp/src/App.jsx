@@ -605,7 +605,7 @@ function App() {
 
   const [isFiltersModalOpen, setIsFiltersModalOpen] = useState(false)
   const [botFilters, setBotFilters] = useState({
-    categorias_activas: ["Intel Core i5", "Intel Core i7", "Intel Core i9", "Ryzen 5", "Ryzen 7", "Ryzen 9", "Intel Core i3"],
+    categorias_activas: ["Intel Core i5", "Intel Core i7", "Intel Core i9", "Ryzen 5", "Ryzen 7", "Ryzen 9"],
     estados_activos: ["New", "Open box", "Certified Refurbished", "Excellent Refurbished", "Very Good Refurbished", "Good Refurbished", "Used"]
   })
   const [isSavingFilters, setIsSavingFilters] = useState(false)
@@ -2928,11 +2928,9 @@ function App() {
                 </h3>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
                   {[
-                    { id: 'Intel Core i3', color: '#60a5fa' },
                     { id: 'Intel Core i5', color: '#3b82f6' },
                     { id: 'Intel Core i7', color: '#2563eb' },
                     { id: 'Intel Core i9', color: '#1d4ed8' },
-                    { id: 'Ryzen 3', color: '#f87171' },
                     { id: 'Ryzen 5', color: '#ef4444' },
                     { id: 'Ryzen 7', color: '#dc2626' },
                     { id: 'Ryzen 9', color: '#b91c1c' },
